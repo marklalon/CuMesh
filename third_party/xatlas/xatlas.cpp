@@ -8093,8 +8093,13 @@ struct Chart
 
 struct AddChartTaskArgs
 {
-	param::Chart *paramChart;
-	Chart *chart; // out
+	// A single task processes a contiguous range [begin, end) of charts. Processing charts in
+	// chunks (instead of one task per chart) amortizes the task scheduler's submit/notify
+	// overhead, which is pathological when there are many small charts (thousands of tiny tasks).
+	param::Chart *const *paramCharts; // flattened input charts
+	Chart **outCharts;                // output array, written at the matching flat index
+	uint32_t begin;
+	uint32_t end;
 };
 
 static void runAddChartTask(void *groupUserData, void *taskUserData)
@@ -8102,36 +8107,38 @@ static void runAddChartTask(void *groupUserData, void *taskUserData)
 	XA_PROFILE_START(packChartsAddChartsThread)
 	auto boundingBox = (ThreadLocal<BoundingBox2D> *)groupUserData;
 	auto args = (AddChartTaskArgs *)taskUserData;
-	param::Chart *paramChart = args->paramChart;
-	XA_PROFILE_START(packChartsAddChartsRestoreTexcoords)
-	paramChart->restoreTexcoords();
-	XA_PROFILE_END(packChartsAddChartsRestoreTexcoords)
-	Mesh *mesh = paramChart->unifiedMesh();
-	Chart *chart = args->chart = XA_NEW(MemTag::Default, Chart);
-	chart->atlasIndex = -1;
-	chart->material = 0;
-	chart->indices = mesh->indices();
-	chart->parametricArea = mesh->computeParametricArea();
-	if (chart->parametricArea < kAreaEpsilon) {
-		// When the parametric area is too small we use a rough approximation to prevent divisions by very small numbers.
-		const Vector2 bounds = paramChart->computeParametricBounds();
-		chart->parametricArea = bounds.x * bounds.y;
+	for (uint32_t ci = args->begin; ci < args->end; ci++) {
+		param::Chart *paramChart = args->paramCharts[ci];
+		XA_PROFILE_START(packChartsAddChartsRestoreTexcoords)
+		paramChart->restoreTexcoords();
+		XA_PROFILE_END(packChartsAddChartsRestoreTexcoords)
+		Mesh *mesh = paramChart->unifiedMesh();
+		Chart *chart = args->outCharts[ci] = XA_NEW(MemTag::Default, Chart);
+		chart->atlasIndex = -1;
+		chart->material = 0;
+		chart->indices = mesh->indices();
+		chart->parametricArea = mesh->computeParametricArea();
+		if (chart->parametricArea < kAreaEpsilon) {
+			// When the parametric area is too small we use a rough approximation to prevent divisions by very small numbers.
+			const Vector2 bounds = paramChart->computeParametricBounds();
+			chart->parametricArea = bounds.x * bounds.y;
+		}
+		chart->surfaceArea = mesh->computeSurfaceArea();
+		chart->vertices = mesh->texcoords();
+		chart->boundaryEdges = &mesh->boundaryEdges();
+		// Compute bounding box of chart.
+		BoundingBox2D &bb = boundingBox->get();
+		bb.clear();
+		for (uint32_t v = 0; v < chart->vertices.length; v++) {
+			if (mesh->isBoundaryVertex(v))
+				bb.appendBoundaryVertex(mesh->texcoord(v));
+		}
+		bb.compute(mesh->texcoords());
+		chart->majorAxis = bb.majorAxis;
+		chart->minorAxis = bb.minorAxis;
+		chart->minCorner = bb.minCorner;
+		chart->maxCorner = bb.maxCorner;
 	}
-	chart->surfaceArea = mesh->computeSurfaceArea();
-	chart->vertices = mesh->texcoords();
-	chart->boundaryEdges = &mesh->boundaryEdges();
-	// Compute bounding box of chart.
-	BoundingBox2D &bb = boundingBox->get();
-	bb.clear();
-	for (uint32_t v = 0; v < chart->vertices.length; v++) {
-		if (mesh->isBoundaryVertex(v))
-			bb.appendBoundaryVertex(mesh->texcoord(v));
-	}
-	bb.compute(mesh->texcoords());
-	chart->majorAxis = bb.majorAxis;
-	chart->minorAxis = bb.minorAxis;
-	chart->minCorner = bb.minCorner;
-	chart->maxCorner = bb.maxCorner;
 	XA_PROFILE_END(packChartsAddChartsThread)
 }
 
@@ -8175,33 +8182,41 @@ struct Atlas
 		}
 		if (chartCount == 0)
 			return;
-		// Run one task per chart.
-		ThreadLocal<BoundingBox2D> boundingBox;
-		TaskGroupHandle taskGroup = taskScheduler->createTaskGroup(&boundingBox, chartCount);
-		Array<AddChartTaskArgs> taskArgs;
-		taskArgs.resize(chartCount);
+		// Flatten the param charts into a contiguous array so they can be processed in chunks.
+		Array<param::Chart *> paramCharts;
+		paramCharts.resize(chartCount);
 		uint32_t chartIndex = 0;
 		for (uint32_t i = 0; i < paramAtlas->meshCount(); i++) {
 			const uint32_t chartGroupsCount = paramAtlas->chartGroupCount(i);
 			for (uint32_t j = 0; j < chartGroupsCount; j++) {
 				const param::ChartGroup *chartGroup = paramAtlas->chartGroupAt(i, j);
 				const uint32_t count = chartGroup->chartCount();
-				for (uint32_t k = 0; k < count; k++) {
-					AddChartTaskArgs &args = taskArgs[chartIndex];
-					args.paramChart = chartGroup->chartAt(k);
-					Task task;
-					task.userData = &taskArgs[chartIndex];
-					task.func = runAddChartTask;
-					taskScheduler->run(taskGroup, task);
-					chartIndex++;
-				}
+				for (uint32_t k = 0; k < count; k++)
+					paramCharts[chartIndex++] = chartGroup->chartAt(k);
 			}
 		}
-		taskScheduler->wait(&taskGroup);
-		// Get task output.
 		m_charts.resize(chartCount);
-		for (uint32_t i = 0; i < chartCount; i++)
-			m_charts[i] = taskArgs[i].chart;
+		// Run a handful of chunked tasks (a few per thread for load balancing) instead of one task
+		// per chart. With many small charts, one-task-per-chart is dominated by scheduler submit /
+		// notify overhead; chunking cuts the task count from chartCount to ~threadCount*4.
+		ThreadLocal<BoundingBox2D> boundingBox;
+		const uint32_t taskCount = min(chartCount, max(1u, taskScheduler->threadCount()) * 4u);
+		const uint32_t chunkSize = (chartCount + taskCount - 1) / taskCount;
+		Array<AddChartTaskArgs> taskArgs;
+		taskArgs.resize(taskCount);
+		TaskGroupHandle taskGroup = taskScheduler->createTaskGroup(&boundingBox, taskCount);
+		for (uint32_t t = 0; t < taskCount; t++) {
+			AddChartTaskArgs &args = taskArgs[t];
+			args.paramCharts = paramCharts.data();
+			args.outCharts = m_charts.data();
+			args.begin = t * chunkSize;
+			args.end = min(chartCount, args.begin + chunkSize);
+			Task task;
+			task.userData = &args;
+			task.func = runAddChartTask;
+			taskScheduler->run(taskGroup, task);
+		}
+		taskScheduler->wait(&taskGroup);
 	}
 
 	void addUvMeshCharts(UvMeshInstance *mesh)

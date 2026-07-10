@@ -45,11 +45,12 @@ public:
         const torch::Tensor& vertices,
         const torch::Tensor& faces,
         std::optional<const torch::Tensor> normals,
-        std::optional<const torch::Tensor> uvs
+        std::optional<const torch::Tensor> uvs,
+        std::optional<const torch::Tensor> materials
     ) {
         check_tensor(vertices, "vertices", torch::kFloat32);
         check_tensor(faces, "faces", torch::kInt32);
-        
+
         // 1. Construct mesh declaration
         cumesh_xatlas::MeshDecl meshDecl;
         meshDecl.vertexCount = static_cast<uint32_t>(vertices.size(0));
@@ -68,7 +69,18 @@ public:
             meshDecl.vertexUvData = uvs->data_ptr<float>();
             meshDecl.vertexUvStride = sizeof(float) * 2;
         }
-        
+        // Per-face material IDs. xatlas never merges faces of different
+        // materials into the same chart, so passing one unique ID per
+        // pre-clustered region lets the whole mesh be added in a SINGLE call
+        // while preserving those regions as hard chart boundaries -- avoiding
+        // the O(numCharts) per-mesh add overhead of one AddMesh per cluster.
+        if (materials.has_value()) {
+            check_tensor(*materials, "materials", torch::kInt32);
+            TORCH_CHECK(materials->size(0) == faces.size(0),
+                        "materials must have one entry per face (faces.size(0))");
+            meshDecl.faceMaterialData = reinterpret_cast<const uint32_t*>(materials->data_ptr<int32_t>());
+        }
+
         // 2. Add mesh to atlas
         cumesh_xatlas::AddMeshError result = cumesh_xatlas::AddMesh(m_atlas, meshDecl);
         if (result != cumesh_xatlas::AddMeshError::Success) {
@@ -179,7 +191,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::class_<cumesh_xatlas::XAtlasWrapper>(m, "Atlas")
         .def(py::init<>())
-        .def("add_mesh", &cumesh_xatlas::XAtlasWrapper::AddMesh)
+        .def("add_mesh", &cumesh_xatlas::XAtlasWrapper::AddMesh,
+             py::arg("vertices"),
+             py::arg("faces"),
+             py::arg("normals") = py::none(),
+             py::arg("uvs") = py::none(),
+             py::arg("materials") = py::none())
         .def("compute_charts", &cumesh_xatlas::XAtlasWrapper::ComputeCharts)
         .def("pack_charts", &cumesh_xatlas::XAtlasWrapper::PackCharts)
         .def("get_mesh", &cumesh_xatlas::XAtlasWrapper::GetMesh);
